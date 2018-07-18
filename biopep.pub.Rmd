@@ -1,0 +1,1108 @@
+---
+pdf_document: default
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+title: "Analysis of Biotins and PTMs in Intrinsically Disordered Proteins"
+html_notebook: default
+---
+  
+```{r global_options, include=FALSE}
+library(knitr)
+opts_chunk$set(fig.width=14, fig.height=8, tidy=TRUE, tidy.opts=list(width.cutoff=100),echo=TRUE, warning=FALSE, message=FALSE)
+opts_knit$set(progress = TRUE, verbose = TRUE)
+
+```
+
+```{r A_Startup, hide=T, warning=FALSE, message=FALSE}
+#---------------------------------------------------------------------------
+# Author 	      : Manasa Ramakrishna, mr726@cam.ac.uk
+# Date started 	: 8th March, 2018
+# Last modified : 5th June, 2018
+# Aim 		      : Obtaining positions of biotinylated peptides
+#--------------------------------------------------------------------------- 
+
+#---------------------------------
+# 00 : Packages/data required
+# R version 3.4.3 
+#---------------------------------
+
+#source("https://bioconductor.org/biocLite.R")
+#install.packages(c("dplyr","stringr"),dependencies = T)
+
+# dplyr, tidyr and stringr are R packages; Rest are from Bioconductor so use installation as shown above.
+library(dplyr)
+library(doBy)
+library(tidyr)
+library(stringr)
+library(gplots)
+library(goseq)
+library(clusterProfiler)
+library(VennDiagram)
+library(Biostrings)
+library(beanplot)
+library(ggplot2)
+library(psych)
+library(mixtools)
+library(reshape2)
+library(ggsci)
+library(ggpubr)
+library(ggforce)
+
+# List of biotinylated peptides from David
+# Sequences for proteins that peptides map to obtained from Uniprot
+
+#---------------------------------
+# 00: Setting working directories
+#---------------------------------
+
+# Working directory
+setwd(getwd())
+
+# Input directory
+indir = paste(getwd(),"Input",sep = "/")
+
+# Output directory
+outdir = paste(getwd(),paste(Sys.Date(),"Output",sep = "_"),sep = "/")
+if (exists(outdir)){
+  print("Outdir exists")
+}else{
+  dir.create(outdir)
+}
+
+
+# Source functions
+source("biopepFunctions.R")
+#source("GO.R")
+
+# Mapping kegg ids to descriptions
+hsa.kegg = mapPathwayToName("hsa")
+
+```
+Having initiated all the libraries necessary for analysis, we next read in each of the 4 biotinylation datasets. If you are trying to reproduce this analysis, you do not need to run sections 01-05 below as the data from these sections has been saved into ".rds" objects available in the "Input" directory. So skip ahead to section 06_Comparing-4-datasets. 
+
+```{r 01_Post-transcriptional-modification-data, eval=F, warning=F, message=F}
+
+#================================================================
+# 01: Add Post-translational modification (PTM) information
+#================================================================
+
+# Read in PTM positions from Phosphosite plus
+ac <- read.delim(paste(indir,"Acetylation_site_dataset ",sep="/"),sep="\t",skip=3,header=T,stringsAsFactors = F)
+ph <- read.delim(paste(indir,"Phosphorylation_site_dataset",sep="/"),sep="\t",skip=3,header=T,stringsAsFactors = F)
+ub <- read.delim(paste(indir,"Ubiquitination_site_dataset",sep="/"),sep="\t",skip=3,header=T,stringsAsFactors = F)
+sm <- read.delim(paste(indir,"Sumoylation_site_dataset",sep="/"),sep="\t",skip=3,header=T,stringsAsFactors = F)
+
+# Merging all data together for human
+ptm = NULL
+names = c("Phosphorylation","Acetylation","Ubiqutination","Sumoylation")
+c = 1
+
+for(data in list(ph,ac,ub,sm)){
+  ptm = rbind(ptm,cbind(data[which(data$ORGANISM == "human"),],PTM = names[c]))
+  c=c+1
+}
+
+# Add data to the ptm dataset and reorganise columns
+ptm$mod.residue = substring(sapply(str_split(ptm$MOD_RSD,"-"),"[[",1),1,1)
+ptm$loc.ptm = substring(sapply(str_split(ptm$MOD_RSD,"-"),"[[",1),2)
+ptm = ptm[,c("GENE","ACC_ID","SITE_...7_AA","MOD_RSD","PTM","mod.residue","loc.ptm")]
+colnames(ptm) = c("gene","uniprot.id","flank.7aa","mod","ptm","mod.residue","loc.ptm")
+
+# Plot of AA residues and ptms 
+pdf(paste(outdir,paste(format(Sys.time(),"%Y-%m-%d_%H.%M.%S"),"Amino-acids-vs-PTMs.pdf",sep="_"),sep="/"),width=12,height=8)
+barplot(table(ptm$ptm,ptm$mod.residue),legend.text = T,col=c("cornflowerblue","lightpink","greenyellow","goldenrod2"),beside = T,xlab = "Amino acid residue",ylab = "Frequency")
+dev.off()
+
+t =table(ptm$ptm,ptm$mod.residue)
+
+#--------------------------------------
+# Collapse by gene and by PTM
+#--------------------------------------
+ptm.by.gene = ptm %>% dplyr::group_by(ptm,uniprot.id) %>% dplyr::summarise(flank.7aa = paste(unique(flank.7aa),collapse=";"),gene.names = paste(unique(gene),collapse=";"), mods = paste(unique(mod),collapse=";"), mod.residues = paste(mod.residue,collapse=","),loc.ptms = paste(sort(as.numeric(unique(loc.ptm))),collapse = ","))
+ptm.by.gene$num.hits = str_count(ptm.by.gene$loc.ptms,",")+1
+
+#-------------------------------------------------
+# Cast so that there is a column per modification
+#-------------------------------------------------
+ptm.by.ptm = spread(ptm.by.gene[,c("ptm","uniprot.id","loc.ptms")], ptm, loc.ptms)
+saveRDS(ptm.by.ptm,paste(indir,"PTMs-by-gene-from-Phosphositeplus.rds",sep="/"))
+write.table(ptm.by.ptm,paste(indir,"PTMs-by-gene-from-Phosphositeplus.txt",sep="/"),sep="\t",row.names=F,quote = F)
+```
+
+```{r 02_Reading-in-DIDBiT, eval=FALSE, warning=F, message=F}
+
+#========================================================================================
+# 02: DIDBiT dataset, Table S27 (https://pubs.acs.org/doi/suppl/10.1021/pr5002862)
+# Schiapparelli LM, McClatchy DB, Liu HH, Sharma P, Yates JR, Cline HT. Direct detection 
+# of biotinylated proteins by mass spectrometry. J Proteome Res. 2014;13(9):3966–78. 
+#========================================================================================
+
+#-----------------------------
+# 2a: Reading in data
+#-----------------------------
+
+# Read in peptide list for biotinylated sites
+# Remove "." and "-" as these making pattern matching problematic
+peplist = read.delim(paste(indir,"DiDBIT_18k_biotins.txt",sep="/"),header=F,sep="\t",stringsAsFactors = F)
+colnames(peplist) = c("hit","uniprot","prot.name")
+peplist$simple.pep = gsub("\\.","",peplist$hit)
+peplist$simple.pep = gsub("\\-","",peplist$simple.pep)
+
+#---------------------------------------------------------
+# 2b: Adding positional information to peptide list
+#---------------------------------------------------------
+
+# Marking all positions of the pattern "(2260776)" in the given peptide sequences
+# Since we have removed "." the pattern is no longer "(226.0776)".
+# The position we want is 1 lower than where the pattern is identified
+# "\\(" indicates that I want to match the "(" as a string. Else it is considered a mathematical operator and ignore
+# Matches found using function str_locate_all from 'stringr' package
+
+pat = "\\(2260776\\)"
+pat.size = 9
+peplist$numhits = sapply(peplist$simple.pep, function(x) str_count(x,pat))
+peplist$hitpos = sapply(peplist$simple.pep, function(x) paste(str_locate_all(x,pat)[[1]][,"start"]-1,collapse=","))
+
+# Those with > 1 hit have to be corrected for position as the pattern "(2260776)" is still there indicating each position so -1*9 for the second match, -2*9 for the third match and so on.
+hit2 = which(peplist$numhits == 2)
+hit3 = which(peplist$numhits == 3)
+
+peplist$hitpos[hit2] = paste(sapply(strsplit(peplist$hitpos[hit2],","),"[[",1), as.numeric(sapply(strsplit(peplist$hitpos[hit2],","),"[[",2))-1*pat.size,sep=",")
+peplist$hitpos[hit3] = paste(sapply(strsplit(peplist$hitpos[hit3],","),"[[",1), as.numeric(sapply(strsplit(peplist$hitpos[hit3],","),"[[",2))-1*pat.size, as.numeric(sapply(strsplit(peplist$hitpos[hit3],","),"[[",3))-2*pat.size,sep=",")
+
+# How many unique uniprot IDS/peptides are represented in the list
+# Didn't realise the peptide list had duplicates until now. 
+# Peptide "R.QSMAFSILNTPK(226.0776)K.L" maps to both Q14980 and HOYFY6, Nuclear mitotic apparatus protein 1 but only Q14980 is reviewed
+
+peplist.dups = peplist[duplicated(peplist),]
+peplist.nodups = peplist[!duplicated(peplist),]
+length(unique(peplist.nodups$hit)) # n = 15223
+length(unique(peplist.nodups$uniprot)) # n = 3418
+
+# Write duplicates to file
+#write.table(peplist.dups,paste(outdir,paste(format(Sys.time(),"%Y-%m-%d_%H.%M.%S"),"DiDBIT_18k_biotins-peptide-duplicates.txt",sep="_"),sep="/"),sep="\t",row.names=F,quote=F)
+
+
+#---------------------------------------------------------
+# 2c: Add protein sequence data to each peptide
+#---------------------------------------------------------
+
+# Downloaded from Uniprot
+seq = read.delim(paste(indir,"DiDBIT-with-sequences.tab",sep="/"),sep="\t",header=T,stringsAsFactors = F)
+colnames(seq)[1] = "uniprot"
+
+# Looking for duplicated Uniprot IDs as 3418 returned 3419 hits
+# P08107 and Q9Y2S0 have multiple new matches as they themselves are obsolete
+seq[grep("P08107|Q9Y2S0",seq$uniprot),]
+
+# Merge sequence data to peptide data using dplyr
+# The 24 extra entries must have multiple mappings to uniprot sequences
+pepseq = left_join(peplist.nodups,seq)
+dim(peplist.nodups) # 15224
+dim(pepseq) # 15248 
+
+# Keep certain columns only
+pepseqlong = pepseq[,c("uniprot","Sequence","Length","Entry.name","Gene.names","Protein.names","hit","simple.pep","numhits","hitpos")]
+length(unique(pepseqlong$uniprot))
+
+#---------------------------------------------------------
+# 2d: Find location of peptide in the protein sequence
+#---------------------------------------------------------
+pepseqlong$simple.pep = gsub("\\(2260776\\)","",pepseqlong$simple.pep)
+pepseqlong$pep.start = str_locate(pepseqlong$Sequence, pepseqlong$simple.pep)[,"start"]
+
+# Calculate the correct positions
+for(i in 1:nrow(pepseqlong)){
+  pepseqlong$hits.loc[i] = paste(as.numeric(unlist(strsplit(pepseqlong[i,"hitpos"],";")))+pepseqlong[i,"pep.start"]-1,collapse=";")
+}
+head(pepseqlong)
+colnames(pepseqlong) = c("uniprot.id","seq","prot.len","uniprot.name","gene.names","protein.names","hits","modified.hits","num.hits","pos.hits","start.hits","loc.hits")
+
+#---------------------------------------------------------
+# 2e : Collapse above information by gene
+#---------------------------------------------------------
+pepseq.by.gene = pepseqlong %>% dplyr::group_by(uniprot.id) %>% dplyr::summarise(seq = paste(unique(seq),collapse=";"), prot.len = paste(unique(prot.len),collapse=";"), uniprot.name = paste(unique(uniprot.name),collapse=";"), gene.names = paste(unique(gene.names),collapse=";"), protein.names = paste(unique(protein.names),collapse=";"), hits = paste(hits,collapse = ";"),modified.hits = paste(modified.hits,collapse = ";"), pos.hits = paste(pos.hits,collapse = ","), start.hits = paste(start.hits,collapse = ","),loc.hits = paste(sort(as.numeric(unique(loc.hits))),collapse = ","))
+colnames(pepseq.by.gene)[1] = "uniprot.id"
+pepseq.by.gene$num.uniq.hits = sapply(pepseq.by.gene$loc.hits,function(x) length(unique(unlist(strsplit(x,",")[[1]])))) 
+
+#--------------------------------------------
+# 2f: Add ptm information
+#--------------------------------------------
+pepseq.by.gene = left_join(pepseq.by.gene,ptms)
+pepseq.by.gene$protein.names = gsub(" ","\\.",sapply(strsplit(pepseq.by.gene$protein.names," \\("),"[[",1))
+pepseq.by.gene$gene.names[which(pepseq.by.gene$gene.names == "")] = "-"
+pepseq.by.gene$gene.names = sapply(strsplit(pepseq.by.gene$gene.names," "),"[[",1)
+head(pepseq.by.gene)
+
+#--------------------------------------------
+# 2g: Print output
+#--------------------------------------------
+#write.table(pepseqlong,paste(outdir,paste(format(Sys.time(),"%Y-%m-%d_%H.%M.%S"),"DiDBIT_18k_biotins-with-positional-information_BY-PEPTIDE.txt",sep="_"),sep="/"),sep="\t",row.names=F,quote=F)
+#write.table(pepseq.by.gene,paste(outdir,paste(format(Sys.time(),"%Y-%m-%d_%H.%M.%S"),"DiDBIT_Biotinylated-sites-with-positional-information_BY-PROTEIN.txt",sep="_"),sep="/"),sep="\t",row.names=F,quote=F)
+#saveRDS(pepseq.by.gene,"Input/DiDBIT-with-biotins-ptms-by-gene.rds")
+
+
+```
+
+```{r 03_Reading-in-BioSITe, eval=F, warning=F, message=F}
+
+#===============================================================================================
+# 03 : Reading in APEX2 biotin sites
+# Kim DI, Cutler JA, Na CH, Reckel S, Renuse S, Madugundu AK, Tahir R, Goldschmidt HL, Reddy KL,
+# Huganir RL, et al. BioSITe: A Method for Direct Detection and Quantitation of Site-Specific 
+# Biotinylation. J Proteome Res. 2018;17(2):759–69. 
+#===============================================================================================
+
+#-----------------------------------
+# 3a: Reading in data
+#-----------------------------------
+
+# Reading in IDs for which we want to map biotin sites
+ap.bio = read.delim(paste(indir,"AP_BioSite_APEX2_Y_biotins.txt",sep="/"),header=T,sep="\t",stringsAsFactors = F,skip=2)
+
+# Using left_join to add missing uniprot IDs
+extra.seq = read.delim(paste(indir,"AP_BioSite-list-with-sequences_16-more.tab", sep="/"),header=T,sep="\t",stringsAsFactors = F)
+ap.bio[which(ap.bio$Uniprot.ID == ""),"Uniprot.ID"] = left_join(ap.bio[which(ap.bio$Uniprot.ID == ""),c("Gene","Uniprot.ID")], extra.seq[,c("Gene","Uniprot")], by = c("Gene"))["Uniprot"]
+
+# Reading in the sequence for IDs which we want to map to biotin sites (manually run and downloaded from Uniprot)
+# Have manually added sequences for the following protein IDs as they are different identifiers. For NES-APEX2, I used the sequence for APEX2
+# BRE,C7orf55-LUC7L2,CKMT1B,DAK,GNB2L1,HIST1H4L,HIST2H3D,MLLT4,NES-APEX2,PRDX1_HUMAN,RPS10-NUDT3,SELK,SYNJ2BP-COX16,TMEM189-UBE2V1,UBE2C_HUMAN,UFD1L
+ap.seq = read.delim(paste(indir,"AP_BioSite-list-with-sequences.tab", sep="/"),header=T,sep="\t",stringsAsFactors = F)
+
+# Merging sequence and peptide information
+ap.bio.seq = merge(ap.bio[,c("Gene","Uniprot.ID","Peptide.Sequence","Peptide.Modifications","hits.pos")],ap.seq[,c("Entry","Entry.name","Protein.names","Gene.names","Length","Sequence")],by.x = "Uniprot.ID",by.y = "Entry",all.x=T,all.y=F)
+
+# Modify the peptide sequence so it can be mapped to protein sequence
+ap.bio.seq$simple.pep = toupper(ap.bio.seq$Peptide.Sequence)
+ap.bio.seq$pep.start = str_locate(ap.bio.seq$Sequence, ap.bio.seq$simple.pep)[,"start"]
+ap.bio.seq$hits.loc = as.numeric(ap.bio.seq$pep.start)+as.numeric(ap.bio.seq$hits.pos)-1
+ap.bio.seq$num.hits = 1
+
+# Modifiy columns and names 
+ap.bio.seq = ap.bio.seq[,c("Uniprot.ID","Sequence","Length","Entry.name","Gene","Protein.names","Peptide.Sequence","simple.pep","Peptide.Modifications","num.hits","hits.pos","pep.start","hits.loc")]
+colnames(ap.bio.seq) = c("uniprot.id","seq","prot.len","uniprot.name","gene.names","protein.names","hits","modified.hits","pep.mods","num.hits","pos.hits","start.hits","loc.hits")
+
+#------------------------------------------
+# 3b: Collapse above information by gene
+#------------------------------------------
+apbio.by.gene = ap.bio.seq %>% dplyr::group_by(uniprot.id) %>% dplyr::summarise(seq = paste(unique(seq),collapse=";"), prot.len = paste(unique(prot.len),collapse=";"), uniprot.name = paste(unique(uniprot.name),collapse=";"), gene.names = paste(unique(gene.names),collapse=";"), protein.names = paste(unique(protein.names),collapse=";"), hits = paste(hits,collapse = ";"),modified.hits = paste(modified.hits,collapse = ";"), pos.hits = paste(pos.hits,collapse = ","), start.hits = paste(start.hits,collapse = ","),loc.hits = paste(sort(as.numeric(unique(loc.hits))),collapse = ","))
+colnames(apbio.by.gene)[1] = "uniprot.id"
+apbio.by.gene$num.hits = str_count(apbio.by.gene$loc.hits,",")+1
+
+#------------------------------------
+# 3c: Add ptm information
+#------------------------------------
+apbio.by.gene = left_join(apbio.by.gene,ptms)
+apbio.by.gene$protein.names = gsub(" ","\\.",sapply(strsplit(apbio.by.gene$protein.names," \\("),"[[",1))
+apbio.by.gene$gene.names[which(apbio.by.gene$gene.names == "")] = "-"
+apbio.by.gene$gene.names = sapply(strsplit(apbio.by.gene$gene.names," "),"[[",1)
+head(apbio.by.gene)
+
+#------------------------------------
+# 3d: Print output
+#------------------------------------
+#write.table(ap.bio.seq,paste(outdir,paste(format(Sys.time(),"%Y-%m-%d_%H.%M.%S"),"BioSITe_Biotinylated-sites-with-positional-information_BY-PEPTIDE.txt",sep="_"),sep="/"),sep="\t",row.names=F,quote=F)
+#write.table(apbio.by.gene,paste(outdir,paste(format(Sys.time(),"%Y-%m-%d_%H.%M.%S"),"BioSITe_Biotinylated-sites-with-positional-information_BY-PROTEIN.txt",sep="_"),sep="/"),sep="\t",row.names=F,quote=F)
+#saveRDS(apbio.by.gene,"Input/BioSITe-with-biotins-ptms-by-gene.rds")
+
+```
+
+```{r 04_Reading-in-SPOTBioID, eval=F, warning=F, message=F}
+
+#=========================================================================
+# 04 : Reading in additional datasets : SPOTbioID hits
+# Lee SY, Lee H, Lee HK, Lee SW, Ha SC, Kwon T, Seo JK, Lee C, Rhee HW. 
+# Proximity-directed labeling reveals a new rapamycin-induced heterodimer 
+# of FKBP25 and FRB in live cells. ACS Cent Sci. 2016;2(8):506–16. 
+#=========================================================================
+
+#-----------------------------------
+# 4a: Reading in data
+#-----------------------------------
+
+# Reading in IDs for which we want to map biotin sites
+spot.bio = read.delim(paste(indir,"SPOTbioID_K_biotins.txt",sep="/"),header=T,sep="\t",stringsAsFactors = F)
+colnames(spot.bio) = c("uniprot.id","hits.pos")
+
+# Reading in the sequence
+spot.seq = read.delim(paste(indir,"SPOTbioID-list-with-sequences.tab", sep="/"),header=T,sep="\t",stringsAsFactors = F)
+
+# Merge biotin maps and sequences
+spot.bio.seq = left_join(spot.bio,spot.seq)
+spot.bio.seq = spot.bio.seq[,c("uniprot.id","Sequence","Length","Entry.name","Gene.names","Protein.names","hits.pos")]
+colnames(spot.bio.seq) = c("uniprot.id","seq","prot.len","uniprot.name","gene.names","protein.names","hits")
+
+#------------------------------------------
+# 4b: Collapse above information by gene
+#------------------------------------------
+spot.by.gene = spot.bio.seq %>% dplyr::group_by(uniprot.id) %>% dplyr::summarise(seq = paste(unique(seq),collapse=";"), prot.len = paste(unique(prot.len),collapse=";"), uniprot.name = paste(unique(uniprot.name),collapse=";"), gene.names = paste(unique(gene.names),collapse=";"), protein.names = paste(unique(protein.names),collapse=";"), loc.hits = paste(sort(unique(hits)),collapse = ","))
+spot.by.gene$num.hits = str_count(spot.by.gene$loc.hits,",")+1
+
+#------------------------------------
+# 4c: Add ptm information
+#------------------------------------
+spot.by.gene = left_join(spot.by.gene,ptms,by="uniprot.id")
+spot.by.gene$protein.names = gsub(" ","\\.",sapply(strsplit(spot.by.gene$protein.names," \\("),"[[",1))
+spot.by.gene$gene.names[which(spot.by.gene$gene.names == "")] = "-"
+spot.by.gene$gene.names = sapply(strsplit(spot.by.gene$gene.names," "),"[[",1)
+head(spot.by.gene)
+
+#------------------------------------
+# 4d: Print output
+#------------------------------------
+#write.table(spot.by.gene,paste(outdir,paste(format(Sys.time(),"%Y-%m-%d_%H.%M.%S"),"SpotBioID_Biotinylated-sites-with-positional-information_BY-PROTEIN.txt",sep="_"),sep="/"),sep="\t",row.names=F,quote=F)
+#saveRDS(spot.by.gene,"Input/SpotBioID-with-biotins-ptms-by-gene.rds")
+
+```
+
+```{r 05_Reading-in-Ab-APEX, eval=F, warning=F, message=F}
+
+#=================================================================================
+# 05 : Reading in additional datasets : APEX Alice Ting hits
+# ID H3BRF5	(or) H3BRF5_HUMAN is obsolete and has no sequence
+# Udeshi ND, Pedram K, Svinkina T, Fereshetian S, Myers SA, Aygun O, Krug K, 
+# Clauser K, Ryan D, Ast T, et al. Antibodies to biotin enable large-scale 
+# detection of biotinylation sites on proteins. Nat Methods. 2017;14(12):1167–70. 
+#=================================================================================
+
+#-----------------------------------
+# 5a : Reading in data
+#-----------------------------------
+apex.at = read.delim(paste(indir,"AT_APEX2_Y_biotins.txt",sep="/"),sep="\t",header=T,stringsAsFactors = F)
+colnames(apex.at) = c("uniprot.id","hits.pos")
+  
+# Reading in the sequence
+apex.seq = read.delim(paste(indir,"AT_APEX2_Y-list-with-sequences.tab", sep="/"),header=T,sep="\t",stringsAsFactors = F)
+
+# Merge biotin maps and sequences
+apex.at.seq = left_join(apex.at,apex.seq)
+apex.at.seq = apex.at.seq[,c("uniprot.id","Sequence","Length","Entry.name","Gene.names","Protein.names","hits.pos")]
+colnames(apex.at.seq) = c("uniprot.id","seq","prot.len","uniprot.name","gene.names","protein.names","hits")
+
+#----------------------------------------
+# 5b: Collapse above information by gene
+#----------------------------------------
+apexat.by.gene = apex.at.seq %>% dplyr::group_by(uniprot.id) %>% dplyr::summarise(seq = paste(unique(seq),collapse=";"), prot.len = paste(unique(prot.len),collapse=";"), uniprot.name = paste(unique(uniprot.name),collapse=";"), gene.names = paste(unique(gene.names),collapse=";"), protein.names = paste(unique(protein.names),collapse=";"), loc.hits = paste(sort(unique(hits)),collapse = ","))
+apexat.by.gene$num.hits = str_count(apexat.by.gene$loc.hits,",")+1
+
+#------------------------------------
+# 5c: Add ptm information
+#------------------------------------
+apexat.by.gene = left_join(apexat.by.gene,ptms,by="uniprot.id")
+apexat.by.gene$protein.names = gsub(" ","\\.",sapply(strsplit(apexat.by.gene$protein.names," \\("),"[[",1))
+apexat.by.gene$gene.names[which(apexat.by.gene$gene.names == "")] = "-"
+apexat.by.gene$gene.names = sapply(strsplit(apexat.by.gene$gene.names," "),"[[",1)
+head(apexat.by.gene)
+
+#------------------------------------
+# 5d: Print output
+#------------------------------------
+#write.table(apexat.by.gene,paste(outdir,paste(format(Sys.time(),"%Y-%m-%d_%H.%M.%S"),"Ab-APEX_Biotinylated-sites-with-positional-information_BY-PROTEIN.txt",sep="_"),sep="/"),sep="\t",row.names=F,quote=F)
+#saveRDS(apexat.by.gene,"Input/Ab-APEX-with-biotins-ptms-by-gene.rds")
+```
+
+```{r 06_Comparing-4-datasets, eval=T, warning=F, message=F}
+
+#================================================================
+# 06: Comparing all 4 datasets
+#================================================================
+
+# Reading datasets in
+pepseq.by.gene = readRDS("Input/DiDBIT-with-biotins-ptms-by-gene.rds")
+apbio.by.gene = readRDS("Input/BioSITe-with-biotins-ptms-by-gene.rds")
+spot.by.gene = readRDS("Input/SpotBioID-with-biotins-ptms-by-gene.rds")
+apexat.by.gene = readRDS("Input/Ab-APEX-with-biotins-ptms-by-gene.rds")
+
+#------------------------------------
+# 6a: Overlap
+#------------------------------------
+biotin.venn <- venn(list(nhs.bio = pepseq.by.gene$uniprot.id,ap.bio = apbio.by.gene$uniprot.id,apex.at = apexat.by.gene$uniprot.id,spot.bio = spot.by.gene$uniprot.id),show.plot=F)
+common.prots = attr(biotin.venn,"intersections")$`nhs.bio:ap.bio:apex.at:spot.bio`
+
+# Colours from package 'wesandersen', palette = 'FantasticFox1'
+cols = c("#FF7F00","#E2D200", "#46ACC8","#B40F20") 
+nums = c(1,2,3,4)
+cnames = c("DiDBIT\n(n = 3418)","BioSITe\n(n = 786)","Ab-APEX\n(n = 527)","SPOTBioID\n(n = 617)")
+dat = list(unique(pepseq.by.gene$uniprot.id),unique(apbio.by.gene$uniprot.id),unique(apexat.by.gene$uniprot.id),unique(spot.by.gene$uniprot.id))
+
+
+#------------------------------------
+# Supplementary Figure : S1A
+#------------------------------------
+pdf(paste(outdir,paste("FigureS1A","VennDiagrams-for-biotinylation-data.pdf",sep="_"),sep="/"),paper="a4r",width=15,height=8)
+i = c(1,2,3,4)
+venn.all <- venn.diagram(dat[i], NULL, fill=cols[i], alpha=c(rep(0.5,length(i))), cex = 2, cat.cex=1, category.names=cnames[i])
+grid.draw(venn.all)
+dev.off()
+system('rm VennDiagram*')
+```
+Calling IDRs has been performed using python scripts for all 4 datssets using 4 different combinations of IDR callers available via D2P2
+1. VSL2b alone
+2. IUPred-L alone 
+3. VSL2b and IUPred-L
+4. All 9 callers in D2P2 only accepting those IDRs that are confirmed by 7 (75%) or more callers.
+We are now merging this data into one large dataframe called "metadat" while annotating proteins with PTM information from PhosphositePlus (section 01_Post-transcriptional-modification-data) above.
+
+```{r 07_Merging-IDR-biotin-PTM-data,  eval=F, warning=F, message=F}
+
+# Read in PTM data
+ptms <- readRDS(paste(indir,"PTMs-by-gene-from-Phosphositeplus.rds",sep="/")) 
+
+# Read in relevant IDR files
+idr.files = grep("HEK293|hek293",invert=T,grep("c7_len1|len1_VSL2b|len1_IUPred-L",list.files("/Users/manasa/Documents/Work/TTT/13_Biopep_DMinde/Python-output",full.names = T), value=T),value=T)
+
+# Setting up to draw plots for all comparisons
+# Plots to PDF and data to an outfile
+
+# METADATA file for cross-comparison
+metadat = data.frame()
+
+# Looping through IDR data
+for(f in idr.files){
+  
+  sample.name = gsub("_outfile.txt","",strsplit(f,"/")[[1]][max(length(strsplit(f,"/")[[1]]))])
+  print(sample.name) # Sample name showing IDR search parameters for output
+  
+  idr.dat <- read.delim(f,sep="\t",header=T,stringsAsFactors = F)
+  #idr.dat = subset(idr.dat, select = -c(protein.names,protter.url)) # going to keep URL; Have simplified protein.names so this should be easier to read
+  colnames(idr.dat)[grep("num.uniq.hits",colnames(idr.dat))] = "num.hits"
+  print(dim(idr.dat))
+  
+  # Add count of PTMs of each type and total
+  idr.dat$num.phos = str_count(idr.dat$Phosphorylation,",")+1
+  idr.dat$num.ac = str_count(idr.dat$Acetylation,",")+1
+  idr.dat$num.ub = str_count(idr.dat$Ubiqutination,",")+1
+  idr.dat$num.sm = str_count(idr.dat$Sumoylation,",")+1
+  idr.dat$tot.ptms = apply(idr.dat[,c("num.phos","num.ac","num.ub","num.sm")],1,sum,na.rm=T)
+  
+  # Collecting residue information for IDRs (could plot histogram of residues by class later on)
+  # Look in biopep-Extras for code
+  for(j in 1:nrow(idr.dat)){
+    seq = ""
+    for(i in unlist(strsplit(idr.dat$idrs[j],","))){
+      #print(i)
+      start = as.integer(strsplit(i,"-")[[1]][1])
+      end = as.integer(strsplit(i,"-")[[1]][2])
+      s2 = substring(idr.dat$seq[2],start,end)
+      seq = paste(seq,s2,sep="")
+      #print(seq)
+    }
+    idr.dat$idr.seq[j] = seq
+  }
+  
+  # Assigning proteins to Madan Babu classes; 0-10% IDR = Structured(S); 10-30% IDR = "Moderately unstructured (M)"; >30% IDR = "Unstructured (U)"
+  # We've renamed these as "Folded (F)", "Partially Folded (P)" and "Unfolded(U)" to make visualisation easier
+  idr.dat$idr.class = "U"
+  idr.dat$idr.class[which(idr.dat$fraction_idr > 0.1 & idr.dat$fraction_idr <= 0.3)] = "P"
+  idr.dat$idr.class[which(idr.dat$fraction_idr <= 0.1)] = "F"
+  idr.dat$idr.class = as.factor(idr.dat$idr.class)
+  
+  # Checking how many ptms overlap with IDR regions
+  # Enumerate IDR ranges
+  idr.dat$idr.pos = sapply(strsplit(idr.dat$idrs,","),function(x) unlist(lapply(strsplit(x,'-'),function(xx) seq(as.integer(xx[1]),as.integer(xx[2]))),use.names = FALSE))
+  
+  # Convert PTM positions to numeric for comparison
+  idr.dat$ptms =  apply(idr.dat[,c("Phosphorylation","Ubiqutination","Acetylation","Sumoylation")], 1, function(x) paste(x[!is.na(x)], collapse = ","))
+  idr.dat$ptms.pos = sapply(idr.dat$ptms,function(y) unlist(lapply(strsplit(y,","), function(x) as.integer(x)),use.names=FALSE))
+  
+  # Intersect IDR and PTM positions
+  for(i in 1:nrow(idr.dat)){
+    idr.dat$idr.ptm.intersect[i] = paste(sort(intersect(idr.dat$ptms.pos[[i]],idr.dat$idr.pos[[i]])),collapse=",")
+    idr.dat$idr.ptm.int.len[i] = length(intersect(idr.dat$ptms.pos[[i]],idr.dat$idr.pos[[i]]))
+  }
+  
+  # Convert biotin positions to numeric
+  idr.dat$biotin.pos = sapply(idr.dat$loc.hits,function(y) unlist(lapply(strsplit(y,","), function(x) as.integer(x)), use.names = FALSE))
+  
+  # Intersect IDRs and biotin positions
+  for(i in 1:nrow(idr.dat)){
+    idr.dat$idr.biotin.intersect[i] = paste(sort(intersect(idr.dat$biotin.pos[[i]],idr.dat$idr.pos[[i]])),collapse=",")
+    idr.dat$idr.biotin.int.len[i] = length(intersect(idr.dat$biotin.pos[[i]],idr.dat$idr.pos[[i]]))
+  }
+  
+  # Making columns of ptms and biotins that don't intersect with idrs
+  idr.dat$biotin.without.idr.len = idr.dat$num.hits-idr.dat$idr.biotin.int.len
+  idr.dat$ptms.without.idr.len = idr.dat$tot.ptms-idr.dat$idr.ptm.int.len
+  
+  # Linear modelling
+  #print(summary(lm(tot.ptms ~ fraction_idr, data = idr.dat, weights=idr.dat$prot.len/max(idr.dat$prot.len))))
+  #print(summary(lm(tot.ptms ~ idr.class, data = idr.dat, weights=idr.dat$prot.len/max(idr.dat$prot.len))))
+  
+  #---------------------------------------------------------------------------------
+  # Combine data into one megafile for cross study comparison
+  #---------------------------------------------------------------------------------
+  study = strsplit(sample.name,"_")[[1]][1]
+  caller = strsplit(sample.name,"_")[[1]][4]
+  consen = strsplit(sample.name,"_")[[1]][2]
+  
+  metadat = rbind(metadat,cbind(study.name=study,caller.name = caller, caller.consen = consen,idr.dat[,c("uniprot.id","seq","idr.seq","prot.len","uniprot.name","gene.names","protein.names","loc.hits","num.hits","Phosphorylation","Acetylation","Ubiqutination","Sumoylation","idrs","consensus","overall.consensus","protein_length","total_idr_length","fraction_idr","number.of.idrs","num.phos","num.ac","num.ub","num.sm","tot.ptms","idr.class","ptms","idr.ptm.intersect","ptms.without.idr.len","idr.ptm.int.len","idr.biotin.intersect","biotin.without.idr.len","idr.biotin.int.len","protter.url")]))
+}
+
+# Saving output to file
+write.table(metadat,paste(outdir,paste(format(Sys.time(),"%Y-%m-%d_%H.%M.%S"),"Biotin-PTM-IDR-data-for-all-studies-and-callers.txt",sep="_"),sep="/"),sep="\t",row.names=F,quote=F)
+saveRDS(metadat,"Input/Biotin-PTM-IDR-data-for-all-studies-and-callers.rds")
+
+```
+Again, don't have to run this section as you can read the data direction in the next section from the file "Biotin-PTM-IDR-data-for-all-studies-and-callers.rds" in the Input folder. The next section is looking at some stats comparing IDRs, PTMs and Biotins. We do this only for the IDR caller "VSL2b" but you can change the parameter "cn" to any of the others "IUPred-L","VSL2b.IUPred-L" or "all-callers"
+
+```{r 08_Stats-for-VSL2b,eval=T, warning=F, message=F}
+
+# Focussing just on a single IDR predictor VSL2b,we derive some stats for various parameters of interest regarding biotins and PTMs within or ourside IDRs.
+metadat = readRDS("Input/Biotin-PTM-IDR-data-for-all-studies-and-callers.rds")
+
+# Summarize data count by study. Divide by 4 as there are 4 caller versions
+table(metadat$study.name)/4
+
+#----------------------------------------------------------------------------------------------
+# Testing changes across multiple groups for multiple parameters
+# Two options here
+# 1. Pairwise-t-test between groups F, P and U
+# 2. ANOVA followed by posthoc correction using TukeyHSD (Honestly significant differences)
+#----------------------------------------------------------------------------------------------
+
+pdf(paste(outdir,paste(format(Sys.time(),"%Y-%m-%d_%H.%M.%S"),"Effect-size-for-pairwise-comparison-of-IDR-classes-and-parameters-VSL2b.pdf",sep="_"),sep="/"),paper="a4r",width=12,height=8)
+
+cn = "VSL2b"
+metadat.vsl = metadat %>% filter(caller.name == cn)
+
+t.stats = data.frame()
+tukey.stats = data.frame()
+plot.names = c("Total PTMs","PTMs outside IDRs","PTMs in IDRs","Total Biotins","Biotins outside IDRs","Biotins in IDRs","Phosphorylation count","Acetylation count","Ubiquitination count","Sumoylation count")
+f = 1
+
+for(p in c("tot.ptms","ptms.without.idr.len","idr.ptm.int.len","num.hits","biotin.without.idr.len","idr.biotin.int.len","num.phos","num.ac","num.ub","num.sm")){
+  par(mfrow=c(2,2),oma=c(1,1,1,0))
+  for(study in unique(metadat.vsl$study.name)){
+    pp = pairwise.t.test(metadat.vsl[which(metadat.vsl$study.name == study),p],metadat.vsl$idr.class[which(metadat.vsl$study.name == study)],p.adj="BH")
+    a = aov(metadat.vsl[which(metadat.vsl$study.name == study),p]~metadat.vsl$idr.class[which(metadat.vsl$study.name == study)])
+    tu = TukeyHSD(a)
+    plotTukeysHSD(TukeyHSD(a),p)
+    title(main = study)
+    mpp = melt(pp$p.value)
+    mpp$param = plot.names[f]
+    mpp$study = study
+    #print(mpp)
+    t.stats = rbind(t.stats,mpp)
+    tukey.stats = rbind(tukey.stats,cbind(study=study,param=plot.names[f],comp=rownames(tu[[1]]),as.data.frame(tu[[1]])))
+  }
+  title(main=plot.names[f], outer=T)
+  mtext(side=1,"Comparisons : F = Folded; P = PartiallyFolded; U = Unfolded", outer=T)
+  mtext(side=2,"Effect Size", outer=T)
+  f = f+1
+}
+
+dev.off()
+
+# Print stats to screen and file
+t.stats = t.stats[which(!is.na(t.stats$value)),]
+t.stats$comp = paste(t.stats$Var1,t.stats$Var2,sep="vs")
+sum.t.stats = t.stats[,c("value","param","study","comp")] %>% spread(study,value)
+#print(sum.t.stats)
+#print(tukey.stats)
+
+write.table(sum.t.stats,paste(outdir,paste(format(Sys.time(),"%Y-%m-%d_%H.%M.%S"),cn,"Pairwise-t-test-pvals.txt",sep="_"),sep="/"),sep="\t",quote=F,row.names=F)
+write.table(tukey.stats,paste(outdir,paste(format(Sys.time(),"%Y-%m-%d_%H.%M.%S"),cn,"Tukey-HSD-ci-pvals.txt",sep="_"),sep="/"),sep="\t",quote=F,row.names=F)
+
+
+#------------------------------------------------
+# Effect size within IDR for biotins
+#------------------------------------------------
+
+pdf(paste(outdir,paste("Effect-size-for-pairwise-comparison-of-biotin-in-IDRs-",cn,".pdf",sep=""),sep="/"),paper="a4r",width=12,height=8)
+  par(mfrow=c(2,2),oma=c(1,1,1,0))
+  for(study in unique(metadat.vsl$study.name)){
+    a = aov(metadat.vsl[which(metadat.vsl$study.name == study),"idr.biotin.int.len"]~metadat.vsl$idr.class[which(metadat.vsl$study.name == study)])
+    tu = TukeyHSD(a)
+    plotTukeysHSD(TukeyHSD(a))
+    title(main = study)
+    tukey.stats = rbind(tukey.stats,cbind(study=study,param=p,comp=rownames(tu[[1]]),as.data.frame(tu[[1]])))
+  }
+  title(main="Biotins.in.IDRs", outer=T)
+  mtext(side=1,"Comparisons : F = Folded; P = PartiallyFolded; U = Unfolded", outer=T)
+  mtext(side=2,"Effect Size", outer=T)
+dev.off()
+
+#------------------------------------------------
+# Effect size within IDR for PTMs
+#------------------------------------------------
+pdf(paste(outdir,paste("Effect-size-for-pairwise-comparison-of-PTMs-in-IDRs-",cn,".pdf",sep=""),sep="/"),paper="a4r",width=12,height=8)
+  par(mfrow=c(2,2),oma=c(1,1,1,0))
+  for(study in unique(metadat.vsl$study.name)){
+    a = aov(metadat.vsl[which(metadat.vsl$study.name == study),"idr.ptm.int.len"]~metadat.vsl$idr.class[which(metadat.vsl$study.name == study)])
+    tu = TukeyHSD(a)
+    plotTukeysHSD(TukeyHSD(a))
+    title(main = study)
+    tukey.stats = rbind(tukey.stats,cbind(study=study,param=p,comp=rownames(tu[[1]]),as.data.frame(tu[[1]])))
+  }
+  title(main="PTMs.in.IDRs", outer=T)
+  mtext(side=1,"Comparisons : F = Folded; P = PartiallyFolded; U = Unfolded", outer=T)
+  mtext(side=2,"Effect Size", outer=T)
+dev.off()
+
+```
+
+These stats are for when the dataset is divided into F, P and U groups. Not overall. Maybe should come later in the analysis.
+
+```{r 09a_Biotin-vs-IDRs_Figure3}
+
+#------------------------------------------------------------
+# Is there an overall correlation between biotins and IDRs ?
+# Done  by study using VSL2b
+#------------------------------------------------------------
+metadat = readRDS("Input/Biotin-PTM-IDR-data-for-all-studies-and-callers.rds")
+
+# Simplifying biotin count
+metadat$numbiotin = metadat$num.hits
+metadat$numbiotin[which(metadat$numbiotin >=5)] = 5
+
+# Some of DiDBIT ids have num.biotins as 0. This is because the peptides map to an isoform that is not the one I get back from Uniprot. So removing these. 
+metadat = metadat[which(metadat$num.hits > 0),]
+metadat$numbiotin = as.factor(metadat$numbiotin)
+
+#----------------------------------------------
+# Figure 3A: IDR fraction and biotins for VSL2b
+#----------------------------------------------
+pdf(paste(outdir,paste("Figure3A","Number.biotins.vs.FractionIDR-VSL2b.pdf",sep="_"),sep="/"),paper="a4r",width=12,height=8)
+caller = "VSL2b"  
+sub = metadat %>% filter(caller.name == caller)
+sub$numbiotin = as.factor(sub$numbiotin)
+levels(sub$numbiotin) = c("1","2","3","4","5","5+")
+sub$numbiotin[which(sub$numbiotin == 5)] = "5+"
+print(paste(study,caller, "cor", round(cor(sub$num.hits,sub$number.of.idrs, use="pairwise.complete.obs"),2), sep=" : "))
+g = ggplot(sub,aes(factor(numbiotin),fraction_idr))+geom_violin(fill="dodgerblue3",draw_quantiles = c(0.5),col="red3",size=1.5)+geom_jitter(col="white",position=position_jitter(0.2),alpha=0.5,size=1)+facet_wrap(~study.name)+theme_bw()+theme(strip.background = element_blank(),strip.text.x = element_blank(),panel.spacing.x = unit(2,"cm"),panel.spacing.y = unit(2,"cm"),axis.title.x=element_blank(),axis.title.y=element_blank(),axis.text=element_text(size=14,face="bold",family="Helvetica"))
+print(g)
+dev.off()
+
+#------------------------------------
+# Background rate of biotins in IDRs
+#------------------------------------
+
+# Calculating biotin background rate by working out how many Lysines/Tyrosines are in IDRs vs across whole gene body
+# Then doing a biomial test using expected rate as "probability of success" and number of biotins in IDRs as "successes" and total biotins as "number of throws"
+# Null hypothesis: The number of successes is no different to the expected probability of success
+
+bgbinom = data.frame()
+
+for(c in unique(metadat$caller.name)){
+  for(s in unique(metadat$study.name)){
+    ab = metadat %>% filter(caller.name == c & study.name == s) %>% dplyr::select(seq,idr.seq,num.hits,idr.biotin.int.len)
+    if(s == "Ab-APEX" | s == "BioSITe"){
+      res = "Y"
+    }else{
+      res = "K" 
+    }
+    ab$allY = str_count(ab$seq,res)
+    ab$idrY = str_count(ab$idr.seq,res)
+    bg = sum(ab$idrY)/sum(ab$allY)
+    
+    # Calculate probability of observing data given background using binomial distribution 
+    # parameter : in/out of an IDR = binary
+    # Assume biotin sites are independent of each other
+    # Not all biotin sites are in IDR
+    
+    tot.biot = sum(ab$num.hits)
+    tot.biot.idr = sum(ab$idr.biotin.int.len)
+    bt = binom.test(tot.biot.idr,tot.biot,p = bg,alternative = "greater")
+    bgbinom = rbind(bgbinom,cbind(s,c,sum(ab$idrY),sum(ab$allY),bg*100,100-(bg*100),tot.biot.idr,tot.biot,(100*tot.biot.idr)/tot.biot,100-((100*tot.biot.idr)/tot.biot),bt$p.value))
+    print(bt)
+  }
+}
+
+# Tidying up the dataframe
+bgbinom[,c(3:10)] = apply(bgbinom[,c(3:10)],2,function(x) as.numeric(as.character(x)))
+bgbinom[,c(5:6,9:10)] = round(bgbinom[,c(5:6,9:10)],2)
+colnames(bgbinom)[5:6] = colnames(bgbinom)[9:10] = c("in","out")
+
+# Creating dataframe for stats
+sb = rbind(cbind(bgbinom[,c(1:2,5:6)],type="Exp"),cbind(bgbinom[,c(1:2,9:10)],type="Obs"))
+colnames(sb)=c("study.name","caller.name","in","out","type")
+sbg = sb %>% gather(key=idr.pos,value=Percentage.of.biotins,"in":"out")
+sbg$Percentage.of.biotins = as.numeric(sbg$Percentage.of.biotins)
+sbg$caller.name = factor(sbg$caller.name, levels=c('VSL2b','VSL2b.IUPred-L','IUPred-L','all-callers'))
+
+# Writing to output
+colnames(bgbinom) = c("Study","Caller","Lysines.in.IDR","Total.Lysines","Perc.Exp.Biotin.in.IDR","Perc.Exp.Biotin.out.IDR","Biotins.in.IDR","Total.biotins","Perc.Obs.Biotin.in.IDR","Perc.Obs.Biotin.out.IDR","Binom.pval")
+write.table(bgbinom,paste(outdir,"Figure3B_Binomial-test-stats.txt",sep="/"),sep="\t",row.names=F,quote=F)
+
+#----------------------------------------
+# Figure 3B: Biotins in IDRs: Exp vs Obs
+#----------------------------------------
+pdf(paste(outdir,paste("Figure3B","Distribution-of-Biotins-in.out.of.IDRs-by-caller-and-study.pdf",sep="_"),sep="/"),paper="a4r",width=12,height=8)
+g = ggplot(sbg[which(sbg$idr.pos == "in"),])+
+    geom_bar(aes(x=study.name,y=Percentage.of.biotins, fill=type,colour=type),stat = "identity", width = 0.5, position = position_dodge())+
+    facet_wrap(~caller.name, ncol=2)+labs(fill="")+
+    scale_fill_manual(values = c(Obs="peachpuff",Exp="paleturquoise"),labels=c("Expected","Observed"))+
+    scale_colour_manual(values = c(Obs="peachpuff",Exp="paleturquoise"),labels=c("Expected","Observed"))+
+    scale_x_discrete(labels = rep(c("Exp","Obs"),4))+
+theme_bw()+
+      theme(text = element_text(size=15),axis.text.x = element_blank(),strip.text = element_blank(),axis.title.x = element_blank(),axis.title.y = element_blank(),legend.position = "none", plot.title = element_text(hjust = 0.5,vjust=0.5),axis.ticks.x = element_blank())
+print(g)
+dev.off()
+
+#------------------------------------
+# Figure 3C: IDR class distribution
+#------------------------------------
+pdf(paste(outdir,paste("Figure3C","Distribution-of-FPU-by-caller-parameters-and-study.pdf",sep="_"),sep="/"),paper="a4r",width=12,height=8)
+par(mfrow=c(2,2))
+par(mar=c(1, 2, 3, 1))
+for (j in c("VSL2b","VSL2b.IUPred-L","IUPred-L","all-callers")){
+  sub = metadat %>% filter(caller.name == j) 
+  tbar = table(sub$study.name,sub$idr.class)
+  barplot(t(tbar*100/rowSums(tbar)), col=c("#998ec3","#ffdc1e","#f1a340"),main = NULL, ylab = NULL,xaxt='n',yaxt='n',las=2)
+  axis(side=2,labels=F) 
+}
+dev.off()
+
+#------------------------------------
+# Figure 3D: Biotins by IDr class
+#------------------------------------
+j = "VSL2b"
+ploty = "violinPlots"
+unit = "idr.biotin.int.len"
+un = "Biotins-in-IDR"
+
+pdf(paste(outdir,paste("Figure3D",j,paste(un,"vs.IDR-classes",ploty,"pdf",sep="."),sep="_"),sep="/"),paper="a4r",width=12,height=8)
+par(mfrow=c(2,2))
+par(mar=c(1, 2, 3, 1))
+for(study in unique(metadat$study.name)){
+  sub = metadat %>% filter(caller.name == j & study.name == study)
+  beanplot(log2(get(unit)+0.1) ~ idr.class, data = sub,log="",what = c(1,1,1,0),bw ="nrd0",col=list("#998ec3","#ffdc1e","#f1a340"),border=list("#998ec3","#ffdc1e","#f1a340"), xlab = "", ylab = "",main = NULL, cex.main=1.2,overallline = "mean",ylim=c(-5,10),xaxt='n',yaxt='n',las=2)
+  axis(side=2,labels=F) 
+}
+dev.off()
+```
+We now have all the images we need for both Figure 3 and supplementary Figure 2 which consists mainly of tables of stats relevant to each panel in Figure 3. Next stop is Figure 4 or the comparison of IDRs and PTMs
+
+```{r 10_PTMs-vs-IDRs}
+
+# Read in PTM data for the HEK293 data from Geiger
+hek.idr = readRDS("Input/HEK293-with-IDR-VSL2b-and-PTMs.rds")
+
+#--------------------------------------
+# Figure 4A: Number IDRs vs Number PTMs
+#--------------------------------------
+pdf(paste(outdir,paste("Figure4A","Num.idrs.vs.num.ptms_HEK293-vs-biotin.pdf",sep="_"),sep="/"),paper="a4r",width=12,height=8)
+cor.hek = ggscatter(hek.idr, x = "number.of.idrs", y = "tot.ptms", 
+          add = "reg.line", conf.int = TRUE, 
+          cor.coef = TRUE, cor.method = "pearson",
+          xlab = NULL, ylab = NULL, cor.coeff.args=list(method = "pearson", label.x.npc = "center", label.y.npc = "top"),cor.coef.size=8)
+cor.meta = ggscatter(metadat[which(metadat$caller.name == "VSL2b"),], x = "number.of.idrs", y = "tot.ptms", 
+          add = "reg.line", conf.int = TRUE, 
+          cor.coef = TRUE, cor.method = "pearson",
+          xlab = NULL, ylab = NULL,cor.coeff.args = list(method = "pearson", label.x.npc = "center", label.y.npc = "top"),cor.coef.size=8)
+
+ggarrange(cor.hek,cor.meta, 
+          labels = c("(i)", "(ii)"),
+          ncol = 1, nrow = 2)
+
+dev.off()
+
+
+#-----------------------------------------------
+# 4B: Different types of PTMs in HEK vs Biotins
+#-----------------------------------------------
+sub1 = hek.idr[,c("uniprot.id","num.phos","num.ac","num.ub","num.sm")]
+sub1$in.biotin.study = "No"
+
+sub2 = metadat[,c("uniprot.id","num.phos","num.ac","num.ub","num.sm")]
+sub2 = unique(sub2)
+sub2$in.biotin.study = "Yes"
+
+sub = rbind(sub1,sub2)
+sub.gather = sub %>% gather(ptm.type,value=num.ptms,num.phos:num.sm)
+sub.gather$ptm.type = factor(sub.gather$ptm.type,levels = c("num.phos","num.ub","num.ac","num.sm"),ordered = TRUE)
+levels(sub.gather$ptm.type) = c("Phosphorylation (Targets S,T,Y)","Ubiqutination (Targets K)","Acetylation (Targets K)","Sumoylation (Targets K)")
+head(sub.gather)
+
+# Geiger all vs Biotin all
+pdf(paste(outdir,paste("Figure4B","Distribution-of-PTM-types-in-HEK-vs-in-Biotin-studies.pdf",sep="_"),sep="/"),paper="a4r",width=12,height=8)
+ptmg = ggplot(sub.gather,aes(in.biotin.study,num.ptms,fill=in.biotin.study))+geom_boxplot(trim=T,notch=T)+facet_wrap(~ptm.type)+scale_fill_manual(guide=FALSE)+scale_fill_jco()+theme_bw()+theme(legend.position="none",strip.text.x = element_blank(),axis.text.x=element_blank(),axis.title.x=element_blank(),axis.title.y=element_blank(),panel.spacing.x = unit(2,"cm"),panel.spacing.y = unit(2,"cm"))+stat_compare_means(method = "t.test",label.x.npc="left",label.y.npc = "top",size=8)+scale_y_log10()
+ptmg
+print(ptmg)
+dev.off()
+
+#------------------------------------------
+# Figure 4C: PTM expected rate for Ub, Sm
+#------------------------------------------
+# Correcting a misspelling
+colnames(metadat)[which(colnames(metadat) == "Ubiqutination")] = "Ubiquitination"
+
+# Looping through each PTM
+ptm.names = c("Phosphorylation","Acetylation","Ubiquitination","Sumoylation")
+t = 1
+
+# PTM background rate
+ubbinom = data.frame()
+
+# 4 PTMs * 4 callers * 4 studies * in/out IDR = 32 per PTM or 128 numbers in total
+for(pt in c("num.phos","num.ac","num.ub","num.sm")){
+  for(c in unique(metadat$caller.name)){
+    for(s in unique(metadat$study.name)){
+      ab = metadat %>% filter(caller.name == c & study.name == s) %>% dplyr::select(seq,idr.seq,pt,ptm.names[t],idr.ptm.intersect)
+      ab$zz = lapply(ab[,ptm.names[t]],function(x) unlist(strsplit(x,",")))
+      ab$zz2 = lapply(ab$idr.ptm.intersect,function(x) unlist(strsplit(x,",")))
+      for(m in 1:nrow(ab)){
+        ab$idr.ub.int[m] = paste(intersect(ab$zz2[[m]],ab$zz[[m]]),collapse=",")[[1]]
+      }
+      
+      ab$idr.ub.int[which(ab$idr.ub.int == "")] = NA
+      ab$num.ub.in.idr = str_count(ab$idr.ub.int,",")+1
+      
+      ab$allK = 0
+      ab$idrK = 0
+      print(paste(pt,c,s,sep="_"))
+      if(pt == "num.phos"){
+        ab$allK = str_count(ab$seq,"S|T|Y")
+        ab$idrK = str_count(ab$idr.seq,"S|T|Y")
+        bg = sum(ab$idrK)/sum(ab$allK)
+      }else{
+        ab$allK = str_count(ab$seq,"K")
+        ab$idrK = str_count(ab$idr.seq,"K")
+        bg = sum(ab$idrK)/sum(ab$allK)
+      }
+     
+      # Calculate probability of observing data given background using binomial distribution
+      # parameter : in/out of an IDR = binary
+      # Assume biotin sites are independent of each other
+      # Not all biotin sites are in IDR
+      
+      tot.ub = sum(ab[,pt],na.rm=T)
+      tot.ub.in.idr = sum(ab$num.ub.in.idr,na.rm=T)
+      bt = binom.test(tot.ub.in.idr,tot.ub,p = bg,alternative = "greater")
+      ubbinom = rbind(ubbinom,cbind(ptm.names[t],s,c,sum(ab$idrK),sum(ab$allK),bg*100,100-(bg*100),tot.ub.in.idr,tot.ub,(100*tot.ub.in.idr)/tot.ub,100-((100*tot.ub.in.idr)/tot.ub),bt$p.value))
+      #print(bt)
+    }
+  }
+  t = t+1
+}
+
+
+ubbinom[,c(4:12)] = apply(ubbinom[,c(4:12)],2,function(x) as.numeric(as.character(x)))
+ubbinom[,c(6:7,10:11)] = round(ubbinom[,c(6:7,10:11)],2)
+
+# Creating dataframe for stats
+#-----------------------------
+colnames(ubbinom) = c("PTM.Type","Study","Caller","Exp.PTM.in.IDR","Exp.PTM.out.IDR","Perc.Exp.PTM.in.IDR","Perc.Exp.PTM.out.IDR","Obs.PTMs.in.IDR","Obs.PTMs","Perc.Obs.PTM.in.IDR","Perc.Obs.PTM.out.IDR","Binom.pval")
+sug =  ubbinom[which(ubbinom$Caller == "VSL2b"),c(1:3,6:7,10:11)]  %>%
+         gather(key=ptm.loc,value=Percentage.of.PTMs,c(Perc.Exp.PTM.in.IDR:Perc.Exp.PTM.out.IDR,Perc.Obs.PTM.in.IDR,Perc.Obs.PTM.out.IDR))
+sug$type = rep(c("Exp","Obs"),each=32)
+sug$idr.pos = c(rep(c("in","out"),each=16),rep(c("in","out"),each=16))
+sug$Percentage.of.PTMs = as.numeric(sug$Percentage.of.PTMs)
+
+# Writing output
+write.table(ubbinom,paste(outdir,"Figure4C_Binomial-test-stats.txt",sep="/"),sep="\t",row.names=F,quote=F)
+
+#-------------------------
+# The actual Figure 4C 
+#-------------------------
+pdf(paste(outdir,paste("Figure4C","Distribution-of-PTMs-in.out.of.IDRs-by-study-VSL2b.pdf",sep="_"),sep="/"),paper="a4r",width=12,height=8)
+g = ggplot(sug[which(sug$idr.pos == "in"),])+
+      geom_bar(aes(x=Study,y=Percentage.of.PTMs, fill=type,colour=type),stat = "identity", width = 0.5, position = position_dodge())+
+    facet_wrap(~PTM.Type, ncol=2)+labs(fill="")+
+    scale_fill_manual(values = c(Obs="peachpuff",Exp="paleturquoise"),labels=c("Expected","Observed"))+
+    scale_colour_manual(values = c(Obs="peachpuff",Exp="paleturquoise"),labels=c("Expected","Observed"))+
+    scale_x_discrete(labels = rep(c("Exp","Obs"),4))+
+theme_bw()+
+      theme(text = element_text(size=15),axis.text.x = element_blank(),axis.title.x = element_blank(),axis.title.y = element_blank(),legend.position = "none", plot.title = element_text(hjust = 0.5,vjust=0.5),axis.ticks.x = element_blank())
+print(g)
+dev.off()
+
+#---------------------------------------------
+# 4D: IDRs in PTMS by class of IDR
+#---------------------------------------------
+
+j = "VSL2b"
+ploty = "violinPlots"
+u = c("idr.ptm.int.len","num.phos","num.ac","num.ub","num.sm")
+un = c("PTMs-in-IDR","Phosphorylation","Acytelation","Ubiquitination","Sumoylation")
+v = 1
+       
+for(unit in u){
+  print(v)
+  pdf(paste(outdir,paste("Figure4D",j,paste(un[v],"vs.IDR-classes",ploty,"pdf",sep="."),sep="_"),sep="/"),paper="a4r",width=12,height=8)
+  par(mfrow=c(2,2))
+  par(mar=c(1, 2, 3, 1))
+  for(study in unique(metadat$study.name)){
+    sub = metadat %>% filter(caller.name == j & study.name == study)
+    beanplot(log2(get(unit)+0.1) ~ idr.class, data = sub,log="",what = c(1,1,1,0),bw ="nrd0",col=list("#998ec3","#ffdc1e","#f1a340"),border=list("#998ec3","#ffdc1e","#f1a340"), xlab = "", ylab = "",main = NULL, cex.main=1.2,overallline = "mean",ylim=c(-5,10),xaxt='n',yaxt='n',las=2)
+  axis(side=2,labels=F)
+  }
+  dev.off()
+  v = v+1
+}
+
+```
+Having generated Figures 3 and 4 and supplementary data tables, the last bit of analysis relevant to the paper is GO enrichment for proteins from each of the 4 studies in question. This was also extended to KEGG pathways. The background list of proteins was the HEK293 proteome from Geiger et al.  
+
+```{r 11a_Function-enrichment-of-proteins,eval=F, warning=F, message=F}
+
+# Doing an enrichment analysis of proteins in each of our studies to Geiger background
+hek.idr = readRDS("Input/HEK293-with-IDR-VSL2b-and-PTMs.rds")
+head(hek.idr)
+
+#hek.annot = myProtMapper(hek.idr$uniprot.id)
+#saveRDS(hek.annot,"Input/HEK293-annotated-list-of-proteins.rds")
+hek.annot = readRDS("Input/HEK293-annotated-list-of-proteins.rds")
+head(hek.annot)
+
+# Make go, interpro and kegg mappings
+hek.go = makeGene2Cat(hek.annot,"query","go.all",";")
+hek.pro = makeGene2Cat(hek.annot,"query","domains",";")
+hek.kegg = makeGene2Cat(hek.annot,"query","kegg",";")
+
+# Adding ancestor annotations to GO above for a more thorough annotation
+#hek.go.anc <- getAllGOTerms(hek.go)
+#saveRDS(hek.go.anc,"Input/HEK293-GO-annotation-with-ancestors.rds")
+hek.go.anc = readRDS("Input/HEK293-GO-annotation-with-ancestors.rds")
+
+# Make a list of proteins for each of the studies
+spot = metadat %>% filter(study.name == "SpotBioID") %>% dplyr::select("uniprot.id") %>% unique
+didbit = metadat %>% filter(study.name == "DiDBIT") %>% dplyr::select("uniprot.id") %>% unique
+abapex = metadat %>% filter(study.name == "Ab-APEX") %>% dplyr::select("uniprot.id") %>% unique
+biosite = metadat %>% filter(study.name == "BioSITe") %>% dplyr::select("uniprot.id") %>% unique
+
+#--------------------------------------------------------------------------------
+# Running go/pro/kegg enrichment for SpotBioID
+#--------------------------------------------------------------------------------
+spot.go = rungoseq(spot$uniprot.id,hek.go, hek.idr$uniprot.id, hek.idr$max,0.05)
+spot.go.anc = rungoseq(spot$uniprot.id,hek.go.anc[,c(2,1)], hek.idr$uniprot.id, hek.idr$max,0.05)
+
+spot.pro = rungoseq(spot$uniprot.id,hek.pro, hek.idr$uniprot.id, hek.idr$max,0.1)
+spot.kegg = rungoseq(spot$uniprot.id,hek.kegg, hek.idr$uniprot.id, hek.idr$max,0.1)
+spot.kegg[[2]]$term = hsa.kegg[gsub("hsa","",spot.kegg[[2]]$category),1]
+
+#--------------------------------------------------------------------------------
+# Running go/pro/kegg enrichment for DiDBIT
+#--------------------------------------------------------------------------------
+didbit.go = rungoseq(didbit$uniprot.id,hek.go, hek.idr$uniprot.id, hek.idr$max,0.05)
+didbit.go.anc = rungoseq(didbit$uniprot.id,hek.go.anc[,c(2,1)], hek.idr$uniprot.id, hek.idr$max,0.05)
+
+didbit.pro = rungoseq(didbit$uniprot.id,hek.pro, hek.idr$uniprot.id, hek.idr$max,0.1)
+didbit.kegg = rungoseq(didbit$uniprot.id,hek.kegg, hek.idr$uniprot.id, hek.idr$max,0.1)
+didbit.kegg[[2]]$term = hsa.kegg[gsub("hsa","",didbit.kegg[[2]]$category),1]
+
+#--------------------------------------------------------------------------------
+# Running go/pro/kegg enrichment for BioSITe
+#--------------------------------------------------------------------------------
+biosite.go = rungoseq(biosite$uniprot.id,hek.go, hek.idr$uniprot.id, hek.idr$max,0.05)
+biosite.go.anc = rungoseq(biosite$uniprot.id,hek.go.anc[,c(2,1)], hek.idr$uniprot.id, hek.idr$max,0.05)
+
+biosite.pro = rungoseq(biosite$uniprot.id,hek.pro, hek.idr$uniprot.id, hek.idr$max,0.1)
+biosite.kegg = rungoseq(biosite$uniprot.id,hek.kegg, hek.idr$uniprot.id, hek.idr$max,0.1)
+biosite.kegg[[2]]$term = hsa.kegg[gsub("hsa","",biosite.kegg[[2]]$category),1]
+
+#--------------------------------------------------------------------------------
+# Running go/pro/kegg enrichment for Ab-APEX
+#--------------------------------------------------------------------------------
+abapex.go = rungoseq(abapex$uniprot.id,hek.go, hek.idr$uniprot.id, hek.idr$max,0.05)
+abapex.go.anc = rungoseq(abapex$uniprot.id,hek.go.anc[,c(2,1)], hek.idr$uniprot.id, hek.idr$max,0.05)
+
+abapex.pro = rungoseq(abapex$uniprot.id,hek.pro, hek.idr$uniprot.id, hek.idr$max,0.1)
+abapex.kegg = rungoseq(abapex$uniprot.id,hek.kegg, hek.idr$uniprot.id, hek.idr$max,0.1)
+abapex.kegg[[2]]$term = hsa.kegg[gsub("hsa","",abapex.kegg[[2]]$category),1]
+
+#-----------------------------------------------------------
+# Saving all go/pro/kegg objects for lazy loading later on
+#-----------------------------------------------------------
+save(spot.go,spot.go.anc,spot.pro,spot.kegg, didbit.go,didbit.go.anc,didbit.pro,didbit.kegg,biosite.go,biosite.go.anc,biosite.pro,biosite.kegg,abapex.go,abapex.go.anc,abapex.pro,abapex.kegg,file = "Input/go-pro-kegg.rda")
+```
+
+
+```{r 11b_Function-enrichment-of-proteins-plots, warning=F, message=F}
+
+# Load saved data
+load("Input/go-pro-kegg.rda")
+
+#--------------------------------------------------------------------------------
+# Putting it all together
+# GO, Interpro and KEGG enrichment for comparing across methods
+# Cluster, GeneRatio, Description, Count, geneID columns are needed
+# Modify all go, interpro and kegg enrichments to make them compatible with enricherPlot
+# Don't need to change original structure, just make a new one with all samples in it. 
+# Use -log10(BH) values for colour
+#--------------------------------------------------------------------------------
+
+all.enrich = NULL
+
+names.en = c("Ab-APEX","BioSITe","DiDBIT","SpotBioID")
+t = 1
+
+for(i in c("abapex","biosite","didbit","spot")){
+    for(j in c("go","go.anc","pro","kegg")){
+      n = paste(i,j,sep=".")
+      print(n)
+      temp = get(n)[[2]]
+      if(nrow(temp)>0){
+        temp = cbind(Cluster = names.en[t],Analysis = j, temp)
+        all.enrich = rbind.fill(all.enrich,temp)
+      }
+    }
+    t=t+1
+}
+
+
+#======================================================================================================
+# Generating plots and writing output based on analysis above
+#======================================================================================================
+
+# There are 3 cases where p value is 0 (very close to). Logging this makes it Inf so setting it to highest value plus 1.
+all.enrich$neg.log10.BH = -log10(all.enrich$BH)
+all.enrich$neg.log10.BH[which(all.enrich$BH == 0)] = max(all.enrich$neg.log10.BH[is.finite(all.enrich$neg.log10.BH)])+1
+
+colnames(all.enrich)[4] = "pValue"
+all.cols = c("Cluster","Analysis","category","obsRatio","expRatio","bgRatio","foldEnrich","pValue","BH","neg.log10.BH","term","ontology","geneID")
+
+#----------------------------------
+# GO plot
+#----------------------------------
+all.go = all.enrich[which(all.enrich$Analysis == "go"),all.cols]
+all.go$Description  = paste("(",all.go$ontology,") ",all.go$term,sep="")
+ego = enricherPlot(data=all.go,N=8,suf="Biotin-GO-enrichment",trunc.len=40,y.size=14,all.size=16,colorBy = "neg.log10.BH",sizeBy = "foldEnrich")
+ego.cc = enricherPlot(data=all.go[which(all.go$ontology == "CC"),],N=8,suf="Biotin-GO-CC-enrichment",trunc.len=40,y.size=14,all.size=16,colorBy = "neg.log10.BH",sizeBy = "foldEnrich")
+
+all.go.anc = all.enrich[which(all.enrich$Analysis == "go.anc"),all.cols]
+all.go.anc$Description  = paste("(",all.go.anc$ontology,") ",all.go.anc$term,sep="")
+ego.anc = enricherPlot(data=all.go.anc,N=8,suf="Biotin-GO-enrichment-with-anc-terms",trunc.len=40,y.size=12,all.size=16,colorBy = "neg.log10.BH",sizeBy = "foldEnrich")
+ego.anc.cc = enricherPlot(data=all.go.anc[which(all.go.anc$ontology == "CC"),],N=8,suf="FigureS1C_Biotin-GO-CC-enrichment-with-anc-terms",trunc.len=40,y.size=12,all.size=16,colorBy = "neg.log10.BH",sizeBy = "foldEnrich")
+
+#----------------------------------
+# Interpro plot
+#----------------------------------
+all.pro = all.enrich[which(all.enrich$Analysis == "pro"),all.cols]
+all.pro$Description = all.pro$category
+#epro = enricherPlot(data=all.pro,N=10,suf="Biotin-enrichment-studies-Interpro-enrichment",trunc.len=40,y.size=14,all.size=16,colorBy = "neg.log10.BH",sizeBy="foldEnrich")
+
+#----------------------------------
+# KEGG plot
+#----------------------------------
+all.kegg = all.enrich[which(all.enrich$Analysis == "kegg"),all.cols]
+all.kegg$Description = paste("(",all.kegg$category,") ",all.kegg$term,sep="")
+#ekegg = enricherPlot(data=all.kegg,N=10,suf="Biotin-enrichment-studies-KEGG-enrichment",trunc.len=40,y.size=14,all.size=16,colorBy = "neg.log10.BH",sizeBy = "foldEnrich")
+
+#----------------------------------
+# Write to output
+#----------------------------------
+all.go.out = all.go[,c("Cluster","category","obsRatio","expRatio","bgRatio","foldEnrich","pValue","BH","neg.log10.BH","term","ontology","geneID")]
+#write.table(all.go.out,paste(outdir,paste(format(Sys.time(),"%Y-%m-%d_%H.%M.%S"),"GO-enrichment-across-biotin-studies.txt",sep="_"),sep="/"),sep="\t",quote=F,row.names=F)
+all.go.anc.out = all.go.anc[,c("Cluster","category","obsRatio","expRatio","bgRatio","foldEnrich","pValue","BH","neg.log10.BH","term","ontology","geneID")]
+#write.table(all.go.anc.out,paste(outdir,paste(format(Sys.time(),"%Y-%m-%d_%H.%M.%S"),"GO-with-ancestors-enrichment-across-biotin-studies.txt",sep="_"),sep="/"),sep="\t",quote=F,row.names=F)
+all.pro.out = all.pro[,c("Cluster","category","obsRatio","expRatio","bgRatio","foldEnrich","pValue","BH","neg.log10.BH","geneID")]
+#write.table(all.pro.out,paste(outdir,paste(format(Sys.time(),"%Y-%m-%d_%H.%M.%S"),"Interpro-enrichment-across-biotin-studies.txt",sep="_"),sep="/"),sep="\t",quote=F,row.names=F)
+all.kegg.out = all.kegg[,c("Cluster","category","term","obsRatio","expRatio","bgRatio","foldEnrich","pValue","BH","neg.log10.BH","geneID")]
+#write.table(all.kegg.out,paste(outdir,paste(format(Sys.time(),"%Y-%m-%d_%H.%M.%S"),"KEGG-enrichment-across-biotin-studies.txt",sep="_"),sep="/"),sep="\t",quote=F,row.names=F)
+
+#------------------------------------------------------------------------------
+# Plots based on whole genome background and using clusterProfiler
+#------------------------------------------------------------------------------
+load("/Users/manasa/Documents/Work/TTT/13_Biopep_DMinde/Input/go-pro-kegg-whole-genome-bg.rda")
+pdf(paste(outdir,paste("GO-KEGG-enrichment-with-whole-human-genome-bg.pdf",sep="_"),sep="/"),paper="a4r",width=12,height=8)
+plot(xx.mf, type="dot")
+plot(xx.cc, type="dot")
+plot(xx.bp, type="dot")
+plot(xx.kegg, type="dot")
+dev.off()
+
+```
+
