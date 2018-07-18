@@ -78,8 +78,8 @@ GO-KEGG-enrichment-with-whole-human-genome-bg.pdf	|	GO enrichment plotting using
 Effect-size-for-pairwise-comparison-of-PTMs-in-IDRs-VSL2b.pdf	|	Effect size plot based on Tukey's HSD for PTMs in IDRs  
 Effect-size-for-pairwise-comparison-of-biotin-in-IDRs-VSL2b.pdf   |       Effect size plot based on Tukey's HSD for PTMs in IDRs  
 Date_Time_Effect-size-for-pairwise-comparison-of-IDR-classes-and-parameters-VSL2b.pdf	   |       Effect size plot based on Tukey's HSD for multiple parameters and IDR classes using VSL2b calls for IDR
-Date_Time_VSL2b_Pairwise-t-test-pvals.txt
-Date_Time_VSL2b_Tukey-HSD-ci-pvals.txt
+Date_Time_VSL2b_Pairwise-t-test-pvals.txt	|	P-values for pairwise t-tests for all groups U-P, P-F, U-F across all studies  
+Date_Time_VSL2b_Tukey-HSD-ci-pvals.txt	|	 P-values for Tukey's HSD tests following an ANOVA for all groups U-P, P-F, U-F across all studies  
 
 ### Figures : Folder containing all main and supplementary Figures from the paper
 
