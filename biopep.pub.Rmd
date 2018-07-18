@@ -784,17 +784,16 @@ hek.idr = readRDS("Input/HEK293-with-IDR-VSL2b-and-PTMs.rds")
 # Figure 4A: Number IDRs vs Number PTMs
 #--------------------------------------
 pdf(paste(outdir,paste("Figure4A","Num.idrs.vs.num.ptms_HEK293-vs-biotin.pdf",sep="_"),sep="/"),paper="a4r",width=12,height=8)
-cor.hek = ggscatter(hek.idr, x = "number.of.idrs", y = "tot.ptms", 
+cor.hek = ggscatter(hek.idr, x = "number.of.idrs", y = "tot.ptms",
           add = "reg.line", conf.int = TRUE, 
           cor.coef = TRUE, cor.method = "pearson",
-          xlab = NULL, ylab = NULL, cor.coeff.args=list(method = "pearson", label.x.npc = "center", label.y.npc = "top"),cor.coef.size=8)
+          xlab = FALSE, ylab = FALSE, cor.coeff.args=list(method = "pearson", label.x.npc = "center", label.y.npc = "top"),cor.coef.size=8,font.tickslab = 16)
 cor.meta = ggscatter(metadat[which(metadat$caller.name == "VSL2b"),], x = "number.of.idrs", y = "tot.ptms", 
           add = "reg.line", conf.int = TRUE, 
           cor.coef = TRUE, cor.method = "pearson",
-          xlab = NULL, ylab = NULL,cor.coeff.args = list(method = "pearson", label.x.npc = "center", label.y.npc = "top"),cor.coef.size=8)
+          xlab = FALSE, ylab = FALSE,cor.coeff.args = list(method = "pearson", label.x.npc = "center", label.y.npc = "top"),cor.coef.size=8,font.tickslab = 16)
 
-ggarrange(cor.hek,cor.meta, 
-          labels = c("(i)", "(ii)"),
+ggarrange(cor.hek,cor.meta,
           ncol = 1, nrow = 2)
 
 dev.off()
