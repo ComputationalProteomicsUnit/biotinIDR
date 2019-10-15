@@ -1,0 +1,126 @@
+---
+title: "Ribo-biotin"
+author: "Manasa Ramakrishna"
+date: "28/09/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Ribo-biotin
+To check whether the overall trend of increased biotinylation in regions of IDR is true in ribosomal proteins. 
+```{r Function_getBgStats}
+
+library(dplyr)
+library(stringr)
+library(doBy)
+library(ggplot2)
+
+# Function to generate binomial test stats and figure
+getBgStats <- function (dat, suf, grp = F){
+  # Biotin background rate
+  bgstats = data.frame()
+  bgbinom = data.frame()
+  
+  for(c in unique(dat$caller.name)){
+    for(s in unique(dat$study.name)){
+      ab = dat %>% filter(caller.name == c & study.name == s) %>% dplyr::select(seq,idr.seq,num.hits,idr.biotin.int.len)
+      if(s == "Ab-APEX" | s == "BioSITe"){
+        res = "Y"
+      }else{
+        res = "K" 
+      }
+      ab$allY = str_count(ab$seq,res)
+      ab$idrY = str_count(ab$idr.seq,res)
+      bg = sum(ab$idrY)/sum(ab$allY)
+      
+      bgstats = rbind(bgstats,cbind(paste(s,"bg",sep="."),c,"Biotins.in.IDRs.bg.sum",bg*100))
+      bgstats = rbind(bgstats,cbind(paste(s,"bg",sep="."),c,"Biotins.outside.IDRs.bg.sum",(100-(bg*100))))
+      
+      # Calculate probability of observing data given background using binomial distribution 
+      # parameter : in/out of an IDR = binary
+      # Assume biotin sites are independent of each other
+      # Not all biotin sites are in IDR
+      
+      tot.biot = sum(ab$num.hits)
+      tot.biot.idr = sum(ab$idr.biotin.int.len)
+      bt = binom.test(tot.biot.idr,tot.biot,p = bg,alternative = "greater")
+      bgbinom = rbind(bgbinom,cbind(s,c,bg*100,100-(bg*100),tot.biot.idr,tot.biot,(100*tot.biot.idr)/tot.biot,100-((100*tot.biot.idr)/tot.biot),bt$p.value))
+      print(bt)
+    }
+  }
+  
+  colnames(bgbinom) = c("Study","Caller","Exp.Biotin.in.IDR","Exp.Biotin.out.IDR","Obs.biotins.in.IDR","Obs.biotins","Perc.biot.in.IDR","Perc.biot.out.IDR","Binom.pval")
+  bgbinom[,c(3:9)] = apply(bgbinom[,c(3:9)],2,function(x) as.numeric(as.character(x)))
+  bgbinom[,c(3:4,7:8)] = round(bgbinom[,c(3:4,7:8)],2)
+  
+  # Distribution of biotins relative to IDR position (in/outside IDRs)
+  sb = summaryBy(cbind(Biotins.in.IDRs=idr.biotin.int.len,Biotins.outside.IDRs=biotin.without.idr.len)~study.name+caller.name,cyto.ribo.dat,FUN=sum)
+  sb[,3:4] = sb[,3:4]*100/rowSums(sb[,3:4])
+  
+  
+  sbg = sb %>% tidyr::gather(key=biotin.loc,value=Percentage.of.biotins,Biotins.in.IDRs.sum:Biotins.outside.IDRs.sum)
+  
+  
+  sbg$study.name = factor(sbg$study.name, levels=c("Ab-APEX.bg","Ab-APEX","BioSITe.bg","BioSITe","DiDBIT.bg","DiDBIT","SpotBioID.bg","SpotBioID"))
+  
+  # Add bgstats to sbg
+  colnames(bgstats) = colnames(sbg) 
+  bgstats$Percentage.of.biotins = round(as.numeric(as.character(bgstats$Percentage.of.biotins)),6)
+  sbg = rbind(sbg,bgstats)
+  
+  # If grp = T, then remove studies that don't have enough data points from the figure.
+  if(grp){
+    sbg = sbg[grep("Ab-APEX|Ab-APEX.bg|DiDBIT|DiDBIT.bg",sbg$study.name),]
+  }
+  
+  pdf(paste(getwd(),"Pub-output",paste(suf,"Distribution-of-Biotins-in.out.of.IDRs-by-caller-and-study.pdf",sep="_"),sep="/"),paper="a4r",width=12,height=8)
+  g = ggplot(sbg)+
+      geom_col(aes(x=study.name,y=Percentage.of.biotins, fill=biotin.loc,colour=biotin.loc))+
+      facet_wrap(~caller.name, ncol=2, scales = "free_y")+labs(fill="")+
+      scale_fill_manual(values = c(Biotins.in.IDRs.sum="peachpuff",Biotins.outside.IDRs.sum="white",Biotins.in.IDRs.bg.sum="peachpuff",Biotins.outside.IDRs.bg.sum="white"),labels=c("Biotins.in.IDRs","Biotins.outside.IDRs"))+
+      scale_colour_manual(values = c(Biotins.in.IDRs.sum="red",Biotins.outside.IDRs.sum="black",Biotins.in.IDRs.bg.sum="blue",Biotins.outside.IDRs.bg.sum="grey"),labels=c("Biotins.in.IDRs","Biotins.outside.IDRs"))+
+      scale_x_discrete(labels = rep(c("Exp","Obs"),4))+
+      theme_bw()+
+      theme(strip.text.x = element_text(size = 15, colour = "black"),text = element_text(size=15),axis.title.x = element_blank(),axis.title.y = element_blank(),legend.position = "none", panel.spacing.x = unit(2,"cm"),panel.spacing.y = unit(3,"cm"))
+  print(g)
+  dev.off()
+  
+  write.table(bgbinom,paste(suf,"binomial-test-stats.txt",sep="_"),sep="\t",row.names=F,quote=F)
+}
+
+```
+
+
+```{r Ribo-biotin}
+#------------------------------------
+# Figure 2B: IDR class distribution
+#------------------------------------
+
+metadat = readRDS("Input/Biotin-PTM-IDR-data-for-all-studies-and-callers.rds")
+
+# Simplifying biotin count
+metadat$numbiotin = metadat$num.hits
+metadat$numbiotin[which(metadat$numbiotin >=5)] = 5
+
+# Some of DiDBIT ids have num.biotins as 0. This is because the peptides map to an isoform that is not the one I get back from Uniprot. So removing these. 
+metadat = metadat[which(metadat$num.hits > 0),]
+metadat$numbiotin = as.factor(metadat$numbiotin)
+
+# Filtering for ribosomal proteins only
+ribodat = metadat[grep("ribosomal",metadat$protein.names),]
+mito.ribo = grep("mitochondrial|Mitochondrial",ribodat$protein.names)
+
+cyto.ribo.dat <- ribodat[-mito.ribo,]
+mito.ribo.dat <- ribodat[mito.ribo,]
+
+dim(cyto.ribo.dat)
+dim(mito.ribo.dat)
+
+# Generate binomial stats and figures
+getBgStats(cyto.ribo.dat,"FigureS6a_Cyto-Ribosomes",grp=FALSE)
+getBgStats(mito.ribo.dat,"FigureS6b_Mito-Ribosomes",grp=TRUE)
+
+```

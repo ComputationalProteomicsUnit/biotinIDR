@@ -795,7 +795,6 @@ cor.meta = ggscatter(metadat[which(metadat$caller.name == "VSL2b"),], x = "numbe
 
 ggarrange(cor.hek,cor.meta,
           ncol = 1, nrow = 2)
-
 dev.off()
 
 
@@ -1103,5 +1102,244 @@ plot(xx.bp, type="dot")
 plot(xx.kegg, type="dot")
 dev.off()
 
+```
+
+
+```{r Protein-abundance-and-idr}
+
+#-------------
+# HEK PAXDB
+#-------------
+paxdb.all <- read.delim("Input/human_full_uniprot_2_paxdb.04.2015.tsv",sep="\t",header=T)
+paxdb.all$uniprot.id = sapply(strsplit(as.character(paxdb.all$Uniprot),"\\|"),"[[",1)
+paxdb.hek = aggregate(paxdb.all$Abundance,by=list(uniprot.id=paxdb.all$uniprot.id), FUN=max)
+colnames(paxdb.hek)[2] = "Abundance"
+paxdb.hek = left_join(paxdb.hek,ptms)
+
+# Working out intervals of abundance 
+# 0%     20%     40%     60%     80%    100% 
+# 36.2   197.0   362.0   618.0  1039.0 68260.0 
+#      Q1      Q2      Q3     Q4      Q5
+qts = quantile(paxdb.hek$Abundance,probs = seq(0,1,0.2))
+
+# Adding quantile information to paxdb abundance
+paxdb.hek$quantile = cut(paxdb.hek$Abundance, qts,labels = c("Q1","Q2","Q3","Q4","Q5"))
+
+# Subset metadat for analysis
+#  Ab-APEX   BioSITe    DiDBIT SpotBioID 
+#      452       759      2857       580
+
+metadat$exp.tyr = str_count(metadat$seq,"Y")
+metadat$exp.idr.tyr = str_count(metadat$idr.seq,"Y")
+metadat$exp.phos = str_count(metadat$seq,"S|T|Y")
+metadat$exp.idr.phos = str_count(metadat$idr.seq,"S|T|Y")
+metadat$exp.sm.ub.ac.ly = str_count(metadat$seq,"K")
+metadat$exp.idr.sm.ub.ac.ly = str_count(metadat$idr.seq,"K")
+
+subdb = dplyr::select(metadat,study.name:prot.len,loc.hits:idrs,total_idr_length:idr.biotin.int.len,exp.tyr:exp.idr.sm.ub.ac.ly)
+
+
+# Join abundance and biotin/PTM data
+paxbio = left_join(subdb,paxdb.hek[,c(1:2,7)])
+table(paxbio$quantile)
+paxbio$quantile = as.character(paxbio$quantile)
+paxbio = paxbio[which(!is.na(paxbio$quantile)),]
+
+#  Q1   Q2   Q3   Q4   Q5 
+# 110  449  842 1163 1930
+
+
+# Distribution plots for fraction_idr
+for(c in unique(paxbio$caller.name)){
+  pdf(paste(outdir,paste(c,"Violin-plots-of-biotins-in-IDRs-by-study-and-abundance.pdf",sep="_"),sep="/"),paper="a4r",width=12,height=8)
+  sub = paxbio[which(paxbio$caller.name == c),]
+  g = ggplot(sub,aes(quantile,fraction_idr))+geom_violin(fill="dodgerblue3",draw_quantiles = c(0.5),col="red3",size=1.5)+geom_jitter(col="white",position=position_jitter(0.2),alpha=0.5,size=1)+facet_wrap(~study.name)+theme_bw()+theme(axis.title.x=element_blank(),axis.title.y=element_blank(),axis.text=element_text(size=14,face="bold",family="Helvetica"), plot.title = element_text(hjust = 0.5,vjust=0.5))+ggtitle(c)
+  print(g)
+  dev.off()
+}
+
+#----------------------------------------
+# Biotins in IDRs: Exp vs Obs
+#----------------------------------------
+# Obs vs Exp level of biotins in/out IDRs and by quartile
+qtbinom = data.frame()
+
+for(c in unique(paxbio$caller.name)){
+  for(s in unique(paxbio$study.name)){
+    for(q in unique(paxbio$quantile)){
+      idrY = allY = 0
+      ab = dplyr::filter(paxbio,caller.name == c & study.name == s & quantile == q) %>% dplyr::select(seq,idr.seq,num.hits,idr.biotin.int.len,exp.tyr,exp.idr.tyr,exp.sm.ub.ac.ly, exp.idr.sm.ub.ac.ly)
+      if(s == "Ab-APEX" | s == "BioSITe"){
+        idrY = sum(ab$exp.idr.tyr)
+        allY = sum(ab$exp.tyr)
+      }else{
+        idrY = sum(ab$exp.idr.sm.ub.ac.ly)
+        allY = sum(ab$exp.sm.ub.ac.ly)
+      }
+    
+    bg = idrY/allY
+    # Calculate probability of observing data given background using binomial distribution 
+    # parameter : in/out of an IDR = binary
+    # Assume biotin sites are independent of each other
+    # Not all biotin sites are in IDR
+    
+    tot.biot = sum(ab$num.hits)
+    tot.biot.idr = sum(ab$idr.biotin.int.len)
+    bt = binom.test(tot.biot.idr,tot.biot,p = bg,alternative = "greater")
+    qtbinom = rbind(qtbinom,cbind(s,c,q,idrY,allY,bg*100,100-(bg*100),tot.biot.idr,tot.biot,(100*tot.biot.idr)/tot.biot,100-((100*tot.biot.idr)/tot.biot),bt$p.value))
+    #print(bt)
+    }
+  }
+}
+
+# Tidying up the dataframe
+qtbinom[,c(4:11)] = apply(qtbinom[,c(4:11)],2,function(x) as.numeric(as.character(x)))
+qtbinom[,c(6:7,10:11)] = round(qtbinom[,c(6:7,10:11)],2)
+colnames(qtbinom)[1:3] = c("study","caller","quantile")
+colnames(qtbinom)[6:7] = colnames(qtbinom)[10:11] = c("in","out")
+colnames(qtbinom)[12] = "pvalue"
+
+# Creating dataframe for stats
+sq = rbind(cbind(qtbinom[,c(1:3,6:7)],type="Exp"),cbind(qtbinom[,c(1:3,10:11)],type="Obs"))
+colnames(sq)=c("study.name","caller.name","quantile","in","out","type")
+sqg = sq %>% gather(key=idr.pos,value=Percentage.of.biotins,"in":"out")
+sqg$Percentage.of.biotins = as.numeric(sqg$Percentage.of.biotins)
+sqg$caller.name = factor(sqg$caller.name, levels=c('VSL2b','VSL2b.IUPred-L','IUPred-L','all-callers'))
+sqg$quantile = factor(sqg$quantile, levels=c('Q1','Q2','Q3','Q4','Q5'))
+
+
+# Numbers and stats in outfile
+write.table(qtbinom,paste(outdir,"Binomial-test-values-by-quartile.txt",sep="/"),sep="\t",row.names=F,quote=F)
+
+# Plots for displaying the differences, if any
+for(c in unique(sqg$caller.name)){
+  pdf(paste(outdir,paste(c,"Distribution-of-Biotins-in.out.of.IDRs-by-study-and-abundance.pdf",sep="_"),sep="/"),paper="a4r",width=12,height=8)
+  g = ggplot(sqg[which(sqg$idr.pos == "in" & sqg$caller.name == c),])+
+      geom_bar(aes(x=quantile,y=Percentage.of.biotins, fill=type,colour=type),stat = "identity", width = 0.5, position = position_dodge())+
+      facet_wrap(~study.name, ncol=2)+labs(fill="")+
+      scale_fill_manual(values = c(Obs="peachpuff",Exp="paleturquoise"),labels=c("Expected","Observed"))+
+      scale_colour_manual(values = c(Obs="peachpuff",Exp="paleturquoise"),labels=c("Expected","Observed"))+
+  theme_bw()+
+        theme(text = element_text(size=15),axis.title.x = element_blank(),axis.title.y = element_blank(),legend.position = "none", plot.title = element_text(hjust = 0.5,vjust=0.5),axis.ticks.x = element_blank())+ggtitle(c)
+  print(g)
+  dev.off()
+}
+
+
+
+
+#----------------------------------------
+# PTMs in IDRs: Exp vs Obs
+#----------------------------------------
+
+# Correcting a misspelling
+colnames(paxbio)[which(colnames(paxbio) == "Ubiqutination")] = "Ubiquitination"
+
+# Looping through each PTM
+ptm.names = c("Phosphorylation","Acetylation","Ubiquitination","Sumoylation")
+
+# Obs vs Exp level of biotins in/out IDRs and by quartile
+qpbinom = data.frame()
+
+for(c in unique(paxbio$caller.name)){
+  for(s in unique(paxbio$study.name)){
+    t = 1
+    for(pt in c("num.phos","num.ac","num.ub","num.sm")){
+      ab = paxbio %>% filter(caller.name == c & study.name == s) %>% dplyr::select(seq,idr.seq,pt,ptm.names[t],idr.ptm.intersect,exp.phos:exp.idr.sm.ub.ac.ly,quantile)
+      ab$zz = lapply(ab[,ptm.names[t]],function(x) unlist(strsplit(x,",")))
+      ab$zz2 = lapply(ab$idr.ptm.intersect,function(x) unlist(strsplit(x,",")))
+      
+      # Calculating the intersect of each PTM with IDRs
+      for(m in 1:nrow(ab)){
+        ab$idr.ub.int[m] = paste(intersect(ab$zz2[[m]],ab$zz[[m]]),collapse=",")[[1]]
+      }
+      
+      ab$idr.ub.int[which(ab$idr.ub.int == "")] = NA
+      ab$num.ub.in.idr = str_count(ab$idr.ub.int,",")+1
+      
+      for(q in unique(paxbio$quantile)){
+        idrY = allY = 0
+        ab2 = dplyr::filter(ab,quantile == q)
+        print(paste(pt,c,s,q,sep="_"))
+        
+        if(pt == "num.phos"){
+          idrY = sum(ab2$exp.idr.phos)
+          allY = sum(ab2$exp.phos)
+        }else{
+          idrY = sum(ab2$exp.idr.sm.ub.ac.ly)
+          allY = sum(ab2$exp.sm.ub.ac.ly)
+        }
+        
+        bg = idrY/allY
+        # Calculate probability of observing data given background using binomial distribution 
+        # parameter : in/out of an IDR = binary
+        # Assume biotin sites are independent of each other
+        # Not all biotin sites are in IDR
+        
+        tot.ptm = sum(ab2[,pt],na.rm=T)
+        tot.ptm.idr = sum(ab2$num.ub.in.idr,na.rm=T)
+        if(tot.ptm > 0){
+          bt = binom.test(tot.ptm.idr,tot.ptm,p = bg,alternative = "greater")
+          qpbinom = rbind(qpbinom,cbind(ptm.names[t],s,c,q,idrY,allY,bg*100,100-(bg*100),tot.ptm.idr,tot.ptm,(100*tot.ptm.idr)/tot.ptm,100-((100*tot.ptm.idr)/tot.ptm),bt$p.value))
+        }else{
+          qpbinom = rbind(qpbinom,cbind(ptm.names[t],s,c,q,idrY,allY,bg*100,100-(bg*100),tot.ptm.idr,tot.ptm,(100*tot.ptm.idr)/tot.ptm,100-((100*tot.ptm.idr)/tot.ptm),"NA"))
+        }
+      }
+      t = t+1
+    }
+  }
+}
+
+# Tidying up the dataframe
+qpbinom[,c(5:12)] = apply(qpbinom[,c(5:12)],2,function(x) as.numeric(as.character(x)))
+qpbinom[,c(7:8,11:12)] = round(qpbinom[,c(7:8,11:12)],2)
+colnames(qpbinom)[1:4] = c("PTM","study","caller","quantile")
+colnames(qpbinom)[7:8] = colnames(qpbinom)[11:12] = c("in","out")
+colnames(qpbinom)[13] = "binom.pvalue"
+
+# Numbers and stats in outfile
+write.table(qpbinom,paste(outdir,"Binomial-test-values-for-PTMs-by-quartile.txt",sep="/"),sep="\t",row.names=F,quote=F)
+
+# Creating dataframe for stats
+sq = rbind(cbind(qpbinom[,c(1:4,7:8)],type="Exp"),cbind(qpbinom[,c(1:4,11:12)],type="Obs"))
+sqg = sq %>% gather(key=idr.pos,value=Percentage.of.biotins,"in":"out")
+sqg$Percentage.of.biotins = as.numeric(sqg$Percentage.of.biotins)
+sqg$quantile = factor(sqg$quantile, levels=c('Q1','Q2','Q3','Q4','Q5'))
+
+
+
+# Plots for displaying the differences, if any
+for(s in unique(sqg$study)){
+  for(c in unique(sqg$caller)){
+    pdf(paste(outdir,paste(s,c,"Distribution-of-PTMs-in.out.of.IDRs-by-study-and-abundance.pdf",sep="_"),sep="/"),paper="a4r",width=12,height=8)
+    g = ggplot(sqg[which(sqg$idr.pos == "in" & sqg$caller == c & sqg$study == s),])+
+        geom_bar(aes(x=quantile,y=Percentage.of.biotins, fill=type,colour=type),stat = "identity", width = 0.5, position = position_dodge())+
+        facet_wrap(~PTM, ncol=2)+labs(fill="")+
+        scale_fill_manual(values = c(Obs="peachpuff",Exp="paleturquoise"),labels=c("Expected","Observed"))+
+        scale_colour_manual(values = c(Obs="peachpuff",Exp="paleturquoise"),labels=c("Expected","Observed"))+
+    theme_bw()+
+          theme(text = element_text(size=15),axis.title.x = element_blank(),axis.title.y = element_blank(),legend.position = "none", plot.title = element_text(hjust = 0.5,vjust=0.5),axis.ticks.x = element_blank())+ggtitle(paste(s,c,sep=":"))
+    print(g)
+    dev.off()
+  }
+}
+
+#--------------------
+# Overall plots
+#--------------------
+pdf("Protein-abundance-plots.pdf",paper="a4r")
+for(t in unique(paxbio$study.name)){
+  par(mfrow=c(2,2))
+  boxplot(data=paxbio %>% dplyr::filter(study.name == t),Abundance~quantile,col=rainbow(5),main = paste(t,"Protein Abundance",sep=" : "))
+  boxplot(data=paxbio %>% dplyr::filter(study.name == t),number.of.idrs~quantile,col=rainbow(5),main=paste(t,"Number of IDRs",sep=" : "))
+  boxplot(data=paxbio %>% dplyr::filter(study.name == t),num.hits~quantile,col=rainbow(5),main = paste(t,"Number of biotins",sep=" : "))
+  boxplot(data=paxbio %>% dplyr::filter(study.name == t),tot.ptms~quantile,col=rainbow(5),main = paste(t,"Number of PTMs",sep=" : "))
+  
+  boxplot(data=paxbio %>% dplyr::filter(study.name == t), biotin.without.idr.len~quantile,col=rainbow(5),main = paste(t,"Number of biotins outside IDRs",sep=" : "))
+  boxplot(data=paxbio %>% dplyr::filter(study.name == t), ptms.without.idr.len~quantile,col=rainbow(5),main = paste(t,"Number of PTMs outside IDRs",sep=" : "))
+  boxplot(data=paxbio %>% dplyr::filter(study.name == t), idr.biotin.int.len~quantile,col=rainbow(5),main = paste(t,"Number of biotins within IDRs",sep=" : "))
+  boxplot(data=paxbio %>% dplyr::filter(study.name == t), idr.ptm.int.len~quantile,col=rainbow(5), main = paste(t,"Number of PTMs within IDRs",sep=" : "))
+}
+dev.off()
 ```
 
