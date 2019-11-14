@@ -662,6 +662,20 @@ metadat = metadat[which(metadat$num.hits > 0),]
 metadat$numbiotin = as.factor(metadat$numbiotin)
 
 #----------------------------------------------
+# Figure 3A: IDR length and biotins for VSL2b
+#----------------------------------------------
+pdf(paste(outdir,paste("Figure3A","Number.biotins.vs.Length-of-IDR-VSL2b.pdf",sep="_"),sep="/"),paper="a4r",width=12,height=8)
+caller = "VSL2b"  
+sub = metadat %>% filter(caller.name == caller)
+sub$numbiotin = as.factor(sub$numbiotin)
+levels(sub$numbiotin) = c("1","2","3","4","5","5+")
+sub$numbiotin[which(sub$numbiotin == 5)] = "5+"
+#print(paste(study,caller, "cor", round(cor(sub$num.hits,sub$total_idr_length, use="pairwise.complete.obs"),2), sep=" : "))
+g = ggplot(sub,aes(factor(numbiotin),total_idr_length))+geom_violin(fill="dodgerblue3",draw_quantiles = c(0.5),col="red3",size=1.5)+geom_jitter(col="white",position=position_jitter(0.2),alpha=0.5,size=1)+facet_wrap(~study.name)+theme_bw()+theme(strip.background = element_blank(),strip.text.x = element_blank(),panel.spacing.x = unit(2,"cm"),panel.spacing.y = unit(2,"cm"),axis.title.x=element_blank(),axis.title.y=element_blank(),axis.text=element_text(size=14,face="bold",family="Helvetica"))+ scale_y_log10() 
+print(g)
+dev.off()
+
+#----------------------------------------------
 # Figure 3A: IDR fraction and biotins for VSL2b
 #----------------------------------------------
 pdf(paste(outdir,paste("Figure3A","Number.biotins.vs.FractionIDR-VSL2b.pdf",sep="_"),sep="/"),paper="a4r",width=12,height=8)
